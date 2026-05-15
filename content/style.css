@@ -190,6 +190,52 @@ input[type="range"]:disabled {
   opacity: 0.5;
 }
 
+#tuning {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 12px 14px;
+  margin-bottom: 14px;
+}
+
+#tuning summary {
+  cursor: pointer;
+  color: var(--muted);
+  font-size: 0.85rem;
+  list-style: none;
+}
+
+#tuning summary::-webkit-details-marker { display: none; }
+#tuning summary::before { content: "▸ "; }
+#tuning[open] summary::before { content: "▾ "; }
+
+.tuning-grid {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 10px;
+  margin-top: 12px;
+}
+
+.tuning-grid label {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 0.85rem;
+  color: var(--muted);
+}
+
+.tuning-grid input, .tuning-grid select {
+  background: var(--bg);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 8px 10px;
+  font-size: 0.95rem;
+  min-height: 38px;
+  -webkit-appearance: none;
+  appearance: none;
+}
+
 .file-drop {
   display: block;
   border: 2px dashed var(--border);

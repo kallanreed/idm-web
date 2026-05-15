@@ -50,21 +50,32 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 export class IdmDevice {
   /**
    * @param {object} [opts]
-   * @param {number} [opts.writeSize=18] - bytes per BLE write (must be <= negotiated MTU - 3).
-   *   Try 182 if 18 works and you want more throughput, or 509 if you're on a stack
-   *   that negotiates MTU 512 (rare in Web Bluetooth).
-   * @param {boolean} [opts.debug=true] - log notifications to console.
+   * @param {number} [opts.writeSize=18]
+   * @param {"auto"|"with-response"|"without-response"} [opts.writeMode="auto"]
+   *   - "auto": pick whichever the characteristic advertises (preferring without-response).
+   *   - "with-response": use ATT Write Request — slower but has BLE-layer flow control;
+   *     better on iOS / Bluefy where the without-response buffer is easy to overflow.
+   *   - "without-response": fastest path but caller must rate-limit.
+   * @param {number} [opts.interWriteMs=20]
+   * @param {boolean} [opts.debug=true]
    */
-  constructor({ writeSize = DEFAULT_WRITE_SIZE, debug = true } = {}) {
+  constructor({
+    writeSize = DEFAULT_WRITE_SIZE,
+    writeMode = "auto",
+    interWriteMs = INTER_WRITE_MS,
+    debug = true,
+  } = {}) {
     this.writeSize = writeSize;
+    this.writeMode = writeMode;
+    this.interWriteMs = interWriteMs;
     this.debug = debug;
     this.device = null;
     this.server = null;
     this.writeChar = null;
     this.notifyChar = null;
-    this._writeFn = null;           // writeValueWithResponse | writeValueWithoutResponse, chosen per char props
-    this._pendingAck = null;        // for chunked-upload status (0/1/2/3)
-    this._anyNotificationListeners = []; // for arbitrary one-shot reads
+    this._writeFn = null;
+    this._pendingAck = null;
+    this._anyNotificationListeners = [];
     this._onDisconnect = null;
   }
 
@@ -128,17 +139,22 @@ export class IdmDevice {
 
     this.writeChar = await service.getCharacteristic(WRITE_CHAR_UUID);
 
-    // Prefer writeWithoutResponse — community iDotMatrix clients (idotmatrix-python,
-    // pixoo-bridge, etc.) all use it exclusively, and on some firmware the
-    // ATT_WRITE_REQ path is purely a BLE-layer ack with no command dispatch.
     const wp = this.writeChar.properties;
-    if (wp.writeWithoutResponse) {
-      this._writeFn = (v) => this.writeChar.writeValueWithoutResponse(v);
-    } else if (wp.write) {
-      this._writeFn = (v) => this.writeChar.writeValueWithResponse(v);
-    } else {
-      this._writeFn = (v) => this.writeChar.writeValueWithoutResponse(v);
+    const withResp = (v) => this.writeChar.writeValueWithResponse(v);
+    const withoutResp = (v) => this.writeChar.writeValueWithoutResponse(v);
+
+    let chosen;
+    if (this.writeMode === "with-response") {
+      chosen = wp.write ? withResp : withoutResp;
+    } else if (this.writeMode === "without-response") {
+      chosen = wp.writeWithoutResponse ? withoutResp : withResp;
+    } else { // auto
+      if (wp.writeWithoutResponse) chosen = withoutResp;
+      else if (wp.write) chosen = withResp;
+      else chosen = withoutResp;
     }
+    this._writeFn = chosen;
+    this._writeFnName = chosen === withResp ? "writeWithResponse" : "writeWithoutResponse";
 
     // Notifications come on a separate characteristic (fa03), not the write char.
     try {
@@ -157,8 +173,7 @@ export class IdmDevice {
     if (this.debug) {
       console.log("[idm] write char:", this.writeChar.uuid, "props:", enabledProps(this.writeChar));
       console.log("[idm] notify char:", this.notifyChar.uuid, "props:", enabledProps(this.notifyChar));
-      console.log("[idm] write method:", wp.writeWithoutResponse ? "writeWithoutResponse" : "writeWithResponse");
-      console.log("[idm] writeSize =", this.writeSize);
+      console.log("[idm] write method:", this._writeFnName, "writeSize:", this.writeSize, "gap:", this.interWriteMs);
     }
   }
 
@@ -238,10 +253,19 @@ export class IdmDevice {
     return { code, size: LED_TYPE_NAMES[code] || `unknown(${code})` };
   }
 
-  async _writeChunked(packet) {
+  async _writeChunked(packet, { onSubWrite } = {}) {
+    let i = 0;
     for (const sub of splitForWrite(packet, this.writeSize)) {
-      await this._writeFn(sub);
-      await sleep(INTER_WRITE_MS);
+      try {
+        await this._writeFn(sub);
+      } catch (err) {
+        const e = new Error(`Write failed at sub-chunk ${i} (size ${sub.length}): ${err.message || err}`);
+        e.cause = err;
+        throw e;
+      }
+      i++;
+      onSubWrite?.(i);
+      if (this.interWriteMs > 0) await sleep(this.interWriteMs);
     }
   }
 

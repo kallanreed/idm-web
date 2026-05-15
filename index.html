@@ -32,6 +32,29 @@
       </div>
     </section>
 
+    <details id="tuning">
+      <summary>BLE tuning</summary>
+      <div class="tuning-grid">
+        <label>
+          <span>Write mode</span>
+          <select id="tune-write-mode">
+            <option value="auto">auto</option>
+            <option value="without-response">without response (fast)</option>
+            <option value="with-response">with response (safer on iOS)</option>
+          </select>
+        </label>
+        <label>
+          <span>Chunk size (bytes)</span>
+          <input id="tune-write-size" type="number" min="18" max="509" step="1" value="18" />
+        </label>
+        <label>
+          <span>Inter-write gap (ms)</span>
+          <input id="tune-gap" type="number" min="0" max="500" step="5" value="20" />
+        </label>
+      </div>
+      <p class="note">Settings apply on the next Connect. Default values are conservative for iOS.</p>
+    </details>
+
     <section id="upload">
       <label class="file-drop" id="drop-zone">
         <input id="file-input" type="file" accept="image/gif" hidden />

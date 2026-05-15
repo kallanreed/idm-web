@@ -23,9 +23,42 @@ const previewOriginal = $("preview-original");
 const previewNormalized = $("preview-normalized");
 const supportNote = $("support-note");
 
-const device = new IdmDevice();
-let normalizedBytes = null;     // Uint8Array of the normalized GIF, ready to send
-let normalizedAnimMs = 100;     // average frame delay of the normalized GIF
+// ---- Tuning (persisted) ----
+const tuneWriteMode = $("tune-write-mode");
+const tuneWriteSize = $("tune-write-size");
+const tuneGap = $("tune-gap");
+
+function loadTuning() {
+  try {
+    const t = JSON.parse(localStorage.getItem("idm.tuning") || "{}");
+    if (t.writeMode) tuneWriteMode.value = t.writeMode;
+    if (t.writeSize) tuneWriteSize.value = t.writeSize;
+    if (t.interWriteMs != null) tuneGap.value = t.interWriteMs;
+  } catch {}
+}
+function saveTuning() {
+  localStorage.setItem("idm.tuning", JSON.stringify({
+    writeMode: tuneWriteMode.value,
+    writeSize: Number(tuneWriteSize.value),
+    interWriteMs: Number(tuneGap.value),
+  }));
+}
+loadTuning();
+for (const el of [tuneWriteMode, tuneWriteSize, tuneGap]) {
+  el.addEventListener("change", saveTuning);
+}
+
+function makeDevice() {
+  return new IdmDevice({
+    writeMode: tuneWriteMode.value,
+    writeSize: Math.max(18, Math.min(509, Number(tuneWriteSize.value) || 18)),
+    interWriteMs: Math.max(0, Math.min(500, Number(tuneGap.value) || 20)),
+  });
+}
+
+let device = makeDevice();
+let normalizedBytes = null;
+let normalizedAnimMs = 100;
 let normalizedBlobUrl = null;
 let originalBlobUrl = null;
 
@@ -43,13 +76,16 @@ if (!isWebBluetoothSupported()) {
   setStatus("Web Bluetooth unavailable");
 }
 
-device.onDisconnect(() => {
-  setStatus("Disconnected");
-  connectBtn.textContent = "Connect";
-  scanAllBtn.hidden = false;
-  brightnessRow.hidden = true;
-  updateSendBtn();
-});
+function attachDeviceHandlers() {
+  device.onDisconnect(() => {
+    setStatus("Disconnected");
+    connectBtn.textContent = "Connect";
+    scanAllBtn.hidden = false;
+    brightnessRow.hidden = true;
+    updateSendBtn();
+  });
+}
+attachDeviceHandlers();
 
 async function runConnect(opts) {
   setError("");
@@ -57,6 +93,9 @@ async function runConnect(opts) {
     await device.disconnect();
     return;
   }
+  // Rebuild the device with current tuning so a freshly tweaked value takes effect.
+  device = makeDevice();
+  attachDeviceHandlers();
   try {
     setStatus(opts?.acceptAll ? "Scanning all devices..." : "Selecting device...");
     await device.connect(opts);
