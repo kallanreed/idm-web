@@ -12,12 +12,19 @@ The app's internal BLE TAG is `MagicDisplay`.
 
 ## 1. BLE / GATT
 
-| Role | UUID | Notes |
-|------|------|-------|
-| Primary service | `000000fa-0000-1000-8000-00805f9b34fb` | All command + media traffic |
-| Write characteristic | `0000fa02-0000-1000-8000-00805f9b34fb` | Write w/ response. Used for everything: control commands, chunked media uploads. The app declares `UUID_WRITE_CHA`, `UUID_WRITE2_CHA`, `UUID_WRITE3_CHA` separately but all three currently resolve to this same UUID. |
-| Version read characteristic | `d44bc439-abfd-45a2-b575-925416129602` | One-shot read for firmware version string |
-| Notify characteristic | `00002902-…` (CCC descriptor on the same service) | Status/ack frames flow back here. The app subscribes via the standard CCCD write. |
+The service `000000fa-…` has **two** characteristics, plus a separate version
+read characteristic:
+
+| Role | UUID | Properties | Notes |
+|------|------|------------|-------|
+| Primary service | `000000fa-0000-1000-8000-00805f9b34fb` | — | All command + media traffic |
+| Write | `0000fa02-0000-1000-8000-00805f9b34fb` | `write` + `writeWithoutResponse` | Every command and chunked-upload sub-write goes here. The Android app declares `UUID_WRITE_CHA`, `UUID_WRITE2_CHA`, `UUID_WRITE3_CHA` as separate constants but all three resolve to this UUID. |
+| Notify | `0000fa03-0000-1000-8000-00805f9b34fb` | `notify` | Status / ack / response frames flow back here. Subscribe via the standard CCCD write (`01 00` to the `0x2902` descriptor; `startNotifications()` in Web Bluetooth handles this). |
+| Version read | `d44bc439-abfd-45a2-b575-925416129602` | `read` | One-shot read for firmware version ASCII string |
+
+(An earlier version of this doc listed `0x2902` as the "notify
+characteristic". That is the standard CCCD *descriptor* UUID, not a separate
+characteristic — the actual notify characteristic is `fa03`.)
 
 Separate OTA service (only used for firmware updates):
 
@@ -27,22 +34,33 @@ Separate OTA service (only used for firmware updates):
 | OTA write | `0000ae01-0000-1000-8000-00805F9B34FB` |
 | OTA notify | `0000ae02-0000-1000-8000-00805f9b34fb` |
 
-**MTU.** The app requests MTU **512** immediately after services are
-discovered. Effective per-write payload becomes **509 bytes**. If MTU
-negotiation fails, the app falls back to **18 bytes** per write. Pick the
-right chunk size based on whichever MTU you negotiated.
+**MTU.** The app calls `requestMtu(512)` with a **1-second delay** after GATT
+connection (`BleManager.setMtu` → `ThreadUtils.asyncDelay(1000L, ...)`), not
+immediately. After negotiation it computes
+`isMtuStatus = (negotiatedMtu >= 100)`. The chunked-upload code uses exactly
+two chunk sizes in `GifAgreement.getSendData`:
 
-**Write type.** Standard `WRITE_TYPE_DEFAULT` (write with response). Each write
-is acknowledged on the BLE layer before the next is issued. Between writes the
-app inserts a **~20 ms delay** (see `curTime = 20` in
-`GifAgreement`/`ImageAgreement`).
+- `isMtuStatus == true` → **509 bytes** per BLE write
+- `isMtuStatus == false` → **18 bytes** per BLE write
+
+There is no in-between in the Java. Pick accordingly based on whatever MTU
+you negotiated.
+
+**Write type.** The Android app uses `WRITE_TYPE_DEFAULT` (write-with-response,
+`ATT_WRITE_REQ`). Each write is acknowledged at the BLE layer before the next
+is issued; between writes the app inserts a **~20 ms delay** (`curTime = 20`
+in `GifAgreement`/`ImageAgreement`). Both write modes are advertised on
+`fa02`, so either is usable in practice (see § Web Bluetooth gotchas).
 
 **Advertising / scan filter.** The app filters scan results by manufacturer
 data: the bytes after a `0xFF` length-prefixed manufacturer-data record must
 begin with `T R 0x00 p` (`{0x54, 0x52, 0x00, 0x70}`) — or `T R 0x00 X`
 (`BROADCAST_AiTURE_PRODUCT_OMNILED`, second byte = `0x86`) for OmniLED
-variants. In practice, filtering by **service UUID `…00fa…`** is also
-sufficient.
+variants. In Web Bluetooth terms: `companyIdentifier: 0x5254` (LE "TR"),
+with an optional `dataPrefix` for the product byte. Filtering by service UUID
+**only works if the device actually advertises the service**, which is
+device/firmware dependent — prefer the manufacturer-data filter, with the
+service-UUID filter as an additional alternative.
 
 ---
 
@@ -109,6 +127,29 @@ Both are sent to the same write characteristic.
      status=0  → "invalid transfer command" (error)
 ```
 
+**Exact upload state machine (from `GifAgreement.onChanged`).** There is
+**no second-ack wait** and **no inter-super-chunk sleep**. After each
+super-chunk, await one notification, then:
+
+```
+status = 0  → invalid transfer command         (hard error, code 10018)
+status = 1  → device wants next super-chunk
+                if more queued: send next
+                if not: ERROR (code 10011) — even though some firmware
+                emits status=1 on the *final* chunk and the upload
+                visually applies anyway
+status = 2  → out of space                     (hard error, code 10016)
+status = 3  → upload complete                  (success — anywhere,
+                including mid-stream; the on-device GIF decoder is
+                allowed to declare itself done once it has enough data)
+```
+
+The 5-second per-super-chunk timeout
+(`Observable.interval(5, SECONDS).take(1)`) is canceled by *any*
+notification, then the handler dispatches on the status byte. Honor this
+state machine literally — adding sleeps or "lenient" interpretation hides
+real bugs.
+
 The 16-byte header (image / GIF flavour, `ImageAgreement` /
 `GifAgreement.sendImageData`):
 
@@ -139,6 +180,16 @@ Notifications from the device share the same 5-byte preamble:
 [len_lo, len_hi, type, sub, status, ...]
 ```
 
+The Java parsers (`parseDataNextPackage`/`parseDataFinish`/etc.) only
+check four bytes — they don't validate length:
+
+```
+bArr[1] == 0          // length high-byte (always 0 in observed frames)
+bArr[2] == <type>     // matches the request's type byte
+bArr[3] == <sub>      // matches the request's sub-opcode
+bArr[4] == <status>
+```
+
 - `type` matches the type byte of the request being acknowledged
   (`1` for GIF, `2` for image, `4` for text, etc.).
 - `status` values, contextually:
@@ -150,8 +201,14 @@ Notifications from the device share the same 5-byte preamble:
 | `2` | out of space / error |
 | `3` | transfer complete |
 
-For short commands, the same shape carries opcode-specific responses (e.g. the
-`getLedType` reply carries the LED size code in the payload bytes).
+For short commands, the same shape carries opcode-specific responses (e.g.
+the `getLedType` reply — see § 5.1).
+
+**Note: not every command produces a reply.** Empirically, some firmware
+revisions silently drop short-command notifications even though the request
+is processed correctly (the upstream Android app handles this by caching
+state locally after the first successful read). Treat notification probes
+as best-effort; don't gate the rest of the connection flow on them.
 
 ---
 
@@ -164,7 +221,7 @@ Source: `BleProtocolN.java` (system + display), `MutilColorAgreement.java`
 
 | Wire bytes | Meaning |
 |---|---|
-| `04 00 01 80` | **Get LED type.** Response carries the panel-size byte. |
+| `04 00 01 80` | **Get LED type.** Response is 9+ bytes (see below). |
 | `0B 00 01 80 yy mm dd dow HH MM SS` | **Sync time.** `yy = year − 2000`; `dow` is day-of-week. |
 | `0A 00 02 80 a b c d e f` | **Eco mode** window (six time bytes; meanings: weekday-flags, on-hour, on-min, off-hour, off-min, mode). |
 | `04 00 03 80` | **Factory reset.** |
@@ -177,6 +234,24 @@ Source: `BleProtocolN.java` (system + display), `MutilColorAgreement.java`
 | `05 00 0B 80 type` | **Mic source type.** |
 | `05 00 0C 80 idx` | **Set chain (joint) index.** |
 | `05 00 0F 80 sec` | **Screen-on time.** `0xFF` reads current value. |
+
+**`getLedType` reply layout** (from `MainActivity.lambda$new$4` — checks
+`bArr.length >= 9 && bArr[2] == 1 && bArr[3] == 0x80`):
+
+| Offset | Field |
+|---:|---|
+| 0–1 | `len_lo, len_hi` |
+| 2 | `0x01` (type) |
+| 3 | `0x80` (sub) |
+| 4 | mcuVersion1 |
+| 5 | mcuVersion2 |
+| 6 | (device-specific — Android passes this byte as a `Message.obj`) |
+| 7 | **screenType — the LED-type code (`AppData.LedType`)** |
+| 8 | pwdFlag |
+
+The LED-type code is at **offset 7**, not offset 5. Earlier text in this
+doc said "Response carries the panel-size byte" without saying which —
+this is which.
 
 ### 5.2 Display / mode (`sub_opcode = 0x01`)
 
@@ -223,10 +298,27 @@ encrypted; everything else goes plaintext.
 ### 6.1 GIF (`type = 1`)
 
 Payload bytes are the **raw GIF file** verbatim. The display has an on-device
-GIF decoder. Animation timing comes from the GIF's own frame delays (sort of)
-**plus** the `anim_ms` field in the header — used to scale frame durations
-via `DeviceMaterialTimeConvert.ConvertTime(timeSign)`. With `slot=12` the
-animation-time field is forced to `0`.
+GIF decoder. Animation timing is governed by two unrelated paths:
+
+1. **Slot = 12 (preview / live).** Header `anim_ms` is forced to `0`; the
+   device uses the encoded GIF's own GCE per-frame delays. Verified — slow
+   playback in early testing was an *encoder bug* (double ms→cs conversion),
+   not the firmware.
+
+2. **Saved slots (`0..11`) and slot 13.** Header `anim_ms` is filled from
+   `DeviceMaterialTimeConvert.ConvertTime(timeSign)`, a five-step speed
+   enum:
+
+   | `timeSign` | `anim_ms` (LE uint16 in header) |
+   |---:|---:|
+   | 1 | 10 |
+   | 2 | 30 |
+   | 3 | 60 |
+   | 4 | 300 |
+   | other / default | 5 |
+
+   That's the entire range; not `(100 - speedNum) * 10` (see § 10.4
+   correction).
 
 ### 6.2 Static image (`type = 2`)
 
@@ -430,19 +522,27 @@ exact native pixel dimensions, re-encode to GIF, then upload.
 
 ### 10.4 Frame delay (GIFs)
 
-The app's DIY animation editor stores a `speedNum` slider (0–100, default
-50). It maps to per-frame delay:
+**Two separate timing systems** — earlier text in this section commingled
+them:
 
-```
-delay_ms = (100 - speedNum) * 10        // 0..1000 ms range
-if frameRate <= 10:                     // floor
-    delay_ms = 20
-```
+1. **DIY animation editor `speedNum` slider** (0–100, default 50). Used
+   only when the app re-encodes a user-drawn animation in the DIY editor.
+   Maps to per-frame delay baked into the *output GIF's GCE delays*:
 
-So minimum is **20 ms / frame** (~50 fps cap) and maximum is **1000 ms /
-frame**. Note this is what gets baked into the GIF the app generates; if
-your driver sends a raw user-supplied GIF, the firmware likely respects
-the GIF's own GCE delays, but I haven't proved that on hardware.
+   ```
+   delay_ms = (100 - speedNum) * 10        // 0..1000 ms
+   if frameRate <= 10: delay_ms = 20       // 50 fps floor
+   ```
+
+2. **`anim_ms` field in the chunked-upload header** (bytes 13–14). Sourced
+   from `DeviceMaterialTimeConvert.ConvertTime(timeSign)` — a five-step
+   speed enum (`{5, 10, 30, 60, 300}` ms). See § 6.1.
+
+For preview-slot uploads (slot 12), `anim_ms` is `0` and the device
+respects the encoded GIF's own GCE delays — **verified on hardware**
+(IDM-774AEF v2.0.6). Make sure your GIF re-encoder writes the source
+delays through correctly; a 10× ms↔centisecond mistake will make
+playback look glacial.
 
 There's no observed cap on frame count beyond what fits in the device's
 storage budget.
@@ -542,7 +642,89 @@ Watch out for:
 
 ---
 
-## 11. Source pointers
+## 11. Byte order on the wire
+
+Everything multi-byte in the protocol is **little-endian on the wire**,
+despite an awkward intermediate representation in the Java. From
+`com.tiro.jlotalibrary.util.ByteUtils`:
+
+- `short2Bytes(s)` returns **big-endian** `[hi, lo]`. Call sites in
+  `GifAgreement` and `BleProtocolN` reverse it byte-by-byte to put LE on
+  the wire.
+- `int2byte(i)` returns **little-endian** `[b0, b1, b2, b3]`. Call sites
+  copy it through directly — already LE on the wire.
+
+Net effect: don't try to deduce byte order from one half of the call —
+look at the wire bytes.
+
+**CRC-32 sanity vector** (standard zlib polynomial `0xEDB88320`,
+reflected):
+
+```
+CRC32("The quick brown fox jumps over the lazy dog") == 0x414fa339
+```
+
+---
+
+## 12. Web Bluetooth gotchas
+
+Worth remembering for any client running in a browser (Chrome / Edge /
+Bluefy):
+
+- **`BluetoothRemoteGATTCharacteristic.properties`** exposes its flags
+  via *prototype getters*. `Object.entries(c.properties)` returns `[]`.
+  Read named flags explicitly: `c.properties.write`,
+  `c.properties.writeWithoutResponse`, `c.properties.notify`, etc.
+
+- **`navigator.bluetooth.requestDevice` filtering:** the device may not
+  list service `000000fa-…` in its advertisement (it usually doesn't).
+  Provide a manufacturer-data filter as an alternative filter entry:
+
+  ```js
+  filters: [
+    { services: [SERVICE_UUID] },
+    { manufacturerData: [{ companyIdentifier: 0x5254 }] }, // "TR" LE
+  ]
+  ```
+
+- **iOS Safari does not support Web Bluetooth.** iPhone users need
+  Bluefy or a similar Chromium-based WebBLE browser.
+
+- **MTU is opaque in Web Bluetooth.** You can't query the negotiated MTU
+  from JS. Pick a chunk size and live with whichever ATT procedure
+  Chromium picks: `writeValueWithResponse` of values >`MTU - 3` triggers
+  the *Long Write Procedure* (Prepare + Execute Write).
+
+- **iOS / Bluefy + `writeValueWithoutResponse`:** the CoreBluetooth
+  internal write queue overflows mid-upload (observed: uploads die at
+  4–6 KB). Use `writeValueWithResponse` instead — slower but has
+  BLE-layer flow control. Verified working chunk size on iOS: **220
+  bytes** with a **50 ms** inter-write gap.
+
+- **Notification subscription:** subscribe on `0000fa03` (the notify
+  characteristic), *not* on the write characteristic. Earlier text in
+  this doc misidentified the notify char.
+
+### 12.1 Working configuration (iPhone + Bluefy + IDM-774AEF 32×32)
+
+| Setting | Value |
+|---|---|
+| Write characteristic | `0000fa02` |
+| Notify characteristic | `0000fa03` |
+| Web Bluetooth call | `writeValueWithResponse` |
+| Chunk size | 220 bytes |
+| Inter-write gap | 50 ms |
+| Per-super-chunk timeout | 5000 ms |
+| Target slot for live display | 12 (preview) |
+| Header anim_ms (slot 12) | 0 |
+
+`getLedType` does **not** reply on this firmware revision — the upstream
+Android app shrugs and stores the panel size locally (`AppData.setLedType`).
+Cache it client-side or let the user pick.
+
+---
+
+## 13. Source pointers
 
 - `com.heaton.baselib.ble.BleManager` — UUIDs, MTU, write helpers
   (lines 70-100 for UUID block).
@@ -563,3 +745,12 @@ Watch out for:
 - `com.tech.idotmatrix.core.data.OTAAgreement` — OTA upload state machine.
 - `com.tech.idotmatrix.util.BGRUtils` — bitmap ↔ BGR ↔ RGB conversion.
 - `com.tech.idotmatrix.AppData` — `ledType` code ↔ pixel-dimensions map.
+- `com.tech.idotmatrix.core.data.DeviceMaterialTimeConvert` — speed-enum
+  → `anim_ms` mapping for saved slots.
+- `com.tiro.jlotalibrary.util.ByteUtils` — `short2Bytes` (BE),
+  `int2byte` (LE). Wire format is always LE; mind the difference.
+- `com.tech.idotmatrix.ui.pattern.main.MainActivity.lambda$new$4` —
+  `getLedType` reply parser (length ≥ 9, LED type at byte 7).
+
+Local jadx decompile (v2.0.6, 2026-04-09):
+`~/temp/sec-analysis/pixel-display/work/jadx_out/sources/`
