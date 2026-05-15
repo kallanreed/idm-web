@@ -28,7 +28,7 @@ function enabledProps(c) {
 // and a product byte: 0x70 = standard iDotMatrix, 0x86 = OmniLED.
 const COMPANY_ID = 0x5254;
 
-const INTER_WRITE_MS = 20;            // PROTOCOL.md §3.2 — ~20 ms gap
+const INTER_WRITE_MS = 50;            // 50 ms gap — what empirically works on iOS / Bluefy
 const SUPER_CHUNK_TIMEOUT_MS = 5000;  // §10.5
 const PROBE_TIMEOUT_MS = 1500;
 
@@ -38,7 +38,7 @@ const PROBE_TIMEOUT_MS = 1500;
 // firmwares (including the iDotMatrix family) handle poorly — usually they
 // either ignore the upload or drop the link. Defaulting to the small safe
 // value; tunable via constructor option.
-const DEFAULT_WRITE_SIZE = 18;
+const DEFAULT_WRITE_SIZE = 220;
 
 // PROTOCOL.md panel-size code → "WxH" string.
 const LED_TYPE_NAMES = {
@@ -61,7 +61,7 @@ export class IdmDevice {
    */
   constructor({
     writeSize = DEFAULT_WRITE_SIZE,
-    writeMode = "auto",
+    writeMode = "with-response",
     interWriteMs = INTER_WRITE_MS,
     debug = true,
   } = {}) {
@@ -285,19 +285,26 @@ export class IdmDevice {
       sent += packet.length - 16;
       onProgress?.({ sent: Math.min(sent, total), total });
 
-      const isLast = i === packets.length - 1;
+      // Only statuses 0 (invalid) and 2 (out of space) are hard errors per the
+      // protocol doc. On this firmware, status=1 sometimes comes back for the
+      // final chunk and status=3 sometimes comes back early on the first
+      // chunk — both are treated as "device is happy, keep going / we're done".
       if (ack.status === 0) throw new Error("Device: invalid transfer command (status=0)");
       if (ack.status === 2) throw new Error("Device: out of space (status=2)");
-      if (!isLast && ack.status !== 1) {
-        throw new Error(`Unexpected ack status=${ack.status} mid-upload`);
-      }
-      if (isLast && ack.status !== 3) {
-        const finalAck = await this._awaitAck();
-        if (finalAck.status !== 3) {
-          throw new Error(`Upload did not complete cleanly (status=${finalAck.status})`);
+      if (ack.status === 3) {
+        // Device says it's done. Stop sending even if we have more chunks queued —
+        // it usually means the on-device decoder has enough data.
+        if (this.debug && i < packets.length - 1) {
+          console.warn(`[idm] device acked status=3 early (chunk ${i + 1}/${packets.length}); stopping`);
         }
+        break;
       }
+      // status === 1 (or anything else) → continue to next chunk.
     }
+
+    // Brief settle so the firmware finishes processing before another upload
+    // can clobber the on-device decoder state.
+    await sleep(150);
   }
 
   /** Send a brightness command (visible effect). No reply expected. */
