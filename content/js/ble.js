@@ -269,6 +269,11 @@ export class IdmDevice {
     }
   }
 
+  // Implements the upload state machine in GifAgreement.onChanged exactly:
+  //   status=1 → send next super-chunk; error 10011 if no more queued
+  //   status=3 → upload complete (success, anywhere — even mid-stream)
+  //   status=2 → out of space
+  //   status=0 → invalid command
   async uploadMedia(fileBytes, { mediaType, slot = SLOT.PREVIEW, animMs = 0, onProgress } = {}) {
     if (!this.connected) throw new Error("Not connected");
 
@@ -285,26 +290,20 @@ export class IdmDevice {
       sent += packet.length - 16;
       onProgress?.({ sent: Math.min(sent, total), total });
 
-      // Only statuses 0 (invalid) and 2 (out of space) are hard errors per the
-      // protocol doc. On this firmware, status=1 sometimes comes back for the
-      // final chunk and status=3 sometimes comes back early on the first
-      // chunk — both are treated as "device is happy, keep going / we're done".
       if (ack.status === 0) throw new Error("Device: invalid transfer command (status=0)");
       if (ack.status === 2) throw new Error("Device: out of space (status=2)");
-      if (ack.status === 3) {
-        // Device says it's done. Stop sending even if we have more chunks queued —
-        // it usually means the on-device decoder has enough data.
-        if (this.debug && i < packets.length - 1) {
-          console.warn(`[idm] device acked status=3 early (chunk ${i + 1}/${packets.length}); stopping`);
+      if (ack.status === 3) return;                                  // done — anywhere
+      if (ack.status === 1) {
+        if (i === packets.length - 1) {
+          // Android errors here too (error 10011). Firmware sometimes does this
+          // on the final chunk; the panel often updated anyway — but we honor
+          // the protocol and surface it.
+          throw new Error("Device sent 'send next' (status=1) after final chunk; upload may or may not have applied");
         }
-        break;
+        continue;
       }
-      // status === 1 (or anything else) → continue to next chunk.
+      throw new Error(`Unexpected ack status=${ack.status}`);
     }
-
-    // Brief settle so the firmware finishes processing before another upload
-    // can clobber the on-device decoder state.
-    await sleep(150);
   }
 
   /** Send a brightness command (visible effect). No reply expected. */
