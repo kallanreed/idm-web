@@ -1,0 +1,14 @@
+{
+  "name": "idm-web",
+  "version": "0.1.0",
+  "description": "Web UI for controlling an iDotMatrix pixel display over BLE",
+  "author": "@kallanreed",
+  "license": "ISC",
+  "scripts": {
+    "dev": "wrangler pages dev .",
+    "deploy": "wrangler pages deploy ."
+  },
+  "dependencies": {
+    "wrangler": "^4.92.0"
+  }
+}

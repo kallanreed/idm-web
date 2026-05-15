@@ -1,0 +1,67 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <meta name="mobile-web-app-capable" content="yes" />
+  <meta name="theme-color" content="#14181f" />
+  <meta name="description" content="iDotMatrix web controller" />
+  <title>iDotMatrix Control</title>
+  <link rel="stylesheet" href="/content/style.css" />
+</head>
+<body>
+  <main>
+    <h1>iDotMatrix</h1>
+
+    <section id="device">
+      <div class="device-row">
+        <button id="connect-btn" type="button">Connect</button>
+        <span id="device-status" class="status">Not connected</span>
+      </div>
+      <button id="scan-all-btn" type="button" class="link-btn">
+        Don't see your device? Scan all
+      </button>
+
+      <div id="brightness-row" hidden>
+        <label for="brightness-slider" class="slider-label">
+          Brightness <span id="brightness-value">100</span>%
+        </label>
+        <input id="brightness-slider" type="range" min="0" max="100" step="1" value="100" />
+      </div>
+    </section>
+
+    <section id="upload">
+      <label class="file-drop" id="drop-zone">
+        <input id="file-input" type="file" accept="image/gif" hidden />
+        <span>Tap to choose a GIF<br /><small>(or drop one here on desktop)</small></span>
+      </label>
+
+      <div class="previews" hidden id="previews">
+        <figure>
+          <figcaption>Original</figcaption>
+          <img id="preview-original" alt="" />
+        </figure>
+        <figure>
+          <figcaption>To device (32x32)</figcaption>
+          <img id="preview-normalized" alt="" />
+        </figure>
+      </div>
+
+      <button id="send-btn" type="button" disabled>Send to device</button>
+
+      <div id="progress" class="status"></div>
+      <div id="error" class="status error"></div>
+
+      <p class="note" id="support-note" hidden>
+        This browser doesn't support Web Bluetooth. On iPhone use the
+        <a href="https://apps.apple.com/us/app/bluefy-web-ble-browser/id1492822055">Bluefy</a>
+        browser; on desktop use Chrome or Edge.
+      </p>
+    </section>
+  </main>
+
+  <script type="module" src="/content/js/app.js"></script>
+</body>
+</html>
